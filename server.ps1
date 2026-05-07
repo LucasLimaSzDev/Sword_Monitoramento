@@ -27,6 +27,21 @@ function Get-CleanArray($Items) {
   }
 }
 
+function Get-RandomBytes([int]$Length) {
+  $bytes = New-Object byte[] $Length
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try {
+    $rng.GetBytes($bytes)
+  } finally {
+    $rng.Dispose()
+  }
+  return $bytes
+}
+
+function ConvertTo-Base64Url([byte[]]$Bytes) {
+  return [Convert]::ToBase64String($Bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+}
+
 function New-EntityId([string]$Prefix) {
   $stamp = (Get-Date).ToString("yyyyMMddHHmmssfff")
   $suffix = -join ((48..57) + (97..102) | Get-Random -Count 6 | ForEach-Object {[char]$_})
@@ -43,6 +58,9 @@ function Read-Store {
   $store.devices = @(Get-CleanArray $store.devices)
   $store.status_events = @(Get-CleanArray $store.status_events)
   $store.alerts = @(Get-CleanArray $store.alerts)
+  $store | Add-Member -NotePropertyName users -NotePropertyValue @(Get-CleanArray $store.users) -Force
+  $store | Add-Member -NotePropertyName sessions -NotePropertyValue @(Get-CleanArray $store.sessions) -Force
+  $store | Add-Member -NotePropertyName audit_logs -NotePropertyValue @(Get-CleanArray $store.audit_logs) -Force
   return $store
 }
 
@@ -50,6 +68,9 @@ function Save-Store($Store) {
   $Store.devices = @(Get-CleanArray $Store.devices)
   $Store.status_events = @(Get-CleanArray $Store.status_events)
   $Store.alerts = @(Get-CleanArray $Store.alerts)
+  $Store | Add-Member -NotePropertyName users -NotePropertyValue @(Get-CleanArray $Store.users) -Force
+  $Store | Add-Member -NotePropertyName sessions -NotePropertyValue @(Get-CleanArray $Store.sessions) -Force
+  $Store | Add-Member -NotePropertyName audit_logs -NotePropertyValue @(Get-CleanArray $Store.audit_logs) -Force
   ConvertTo-Json -InputObject $Store -Depth 20 -Compress | Set-Content -LiteralPath $DataFile -Encoding UTF8
 }
 
@@ -76,18 +97,26 @@ function Read-RequestJson($Request) {
   return $body | ConvertFrom-Json
 }
 
-function Send-Raw($Context, [byte[]]$Bytes, [string]$ContentType, [int]$StatusCode = 200) {
+function Send-Raw($Context, [byte[]]$Bytes, [string]$ContentType, [int]$StatusCode = 200, [string[]]$ExtraHeaders = @()) {
   $reason = switch ($StatusCode) {
     200 { "OK" }
     201 { "Created" }
     400 { "Bad Request" }
+    401 { "Unauthorized" }
     403 { "Forbidden" }
     404 { "Not Found" }
     500 { "Internal Server Error" }
     default { "OK" }
   }
 
-  $header = "HTTP/1.1 $StatusCode $reason`r`nContent-Type: $ContentType`r`nContent-Length: $($Bytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`n`r`n"
+  $extra = ""
+  foreach ($line in $ExtraHeaders) {
+    if (-not [string]::IsNullOrWhiteSpace($line)) {
+      $extra += "$line`r`n"
+    }
+  }
+
+  $header = "HTTP/1.1 $StatusCode $reason`r`nContent-Type: $ContentType`r`nContent-Length: $($Bytes.Length)`r`nConnection: close`r`nCache-Control: no-store`r`n$extra`r`n"
   $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($header)
   $Context.Stream.Write($headerBytes, 0, $headerBytes.Length)
   $Context.Stream.Write($Bytes, 0, $Bytes.Length)
@@ -95,16 +124,16 @@ function Send-Raw($Context, [byte[]]$Bytes, [string]$ContentType, [int]$StatusCo
   $Context.Client.Close()
 }
 
-function Send-Json($Context, $Data, [int]$StatusCode = 200) {
+function Send-Json($Context, $Data, [int]$StatusCode = 200, [string[]]$ExtraHeaders = @()) {
   $json = ConvertTo-Json -InputObject $Data -Depth 20 -Compress
   if ([string]::IsNullOrWhiteSpace($json)) {
     $json = "null"
   }
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-  Send-Raw $Context $bytes "application/json; charset=utf-8" $StatusCode
+  Send-Raw $Context $bytes "application/json; charset=utf-8" $StatusCode $ExtraHeaders
 }
 
-function Send-JsonArray($Context, $Items, [int]$StatusCode = 200) {
+function Send-JsonArray($Context, $Items, [int]$StatusCode = 200, [string[]]$ExtraHeaders = @()) {
   $array = @(Get-CleanArray $Items)
   if ($array.Count -eq 0) {
     $json = "[]"
@@ -113,7 +142,7 @@ function Send-JsonArray($Context, $Items, [int]$StatusCode = 200) {
   }
 
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-  Send-Raw $Context $bytes "application/json; charset=utf-8" $StatusCode
+  Send-Raw $Context $bytes "application/json; charset=utf-8" $StatusCode $ExtraHeaders
 }
 
 function Send-Text($Context, [string]$Text, [int]$StatusCode = 200) {
@@ -180,6 +209,241 @@ function Get-DeviceById($Store, [string]$DeviceId) {
 
 function Test-AllowedValue([string]$Value, [string[]]$Allowed) {
   return $Allowed -contains "$Value".ToLowerInvariant()
+}
+
+function Get-PasswordHash([string]$Password) {
+  $iterations = 120000
+  $salt = Get-RandomBytes 16
+  $derive = [System.Security.Cryptography.Rfc2898DeriveBytes]::new($Password, $salt, $iterations, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+  try {
+    $hash = $derive.GetBytes(32)
+  } finally {
+    $derive.Dispose()
+  }
+
+  return "pbkdf2-sha256:${iterations}:$([Convert]::ToBase64String($salt)):$([Convert]::ToBase64String($hash))"
+}
+
+function Test-PasswordHash([string]$Password, [string]$StoredHash) {
+  if ([string]::IsNullOrWhiteSpace($Password) -or [string]::IsNullOrWhiteSpace($StoredHash)) {
+    return $false
+  }
+
+  $parts = @($StoredHash -split ":")
+  if ($parts.Count -ne 4 -or $parts[0] -ne "pbkdf2-sha256") {
+    return $false
+  }
+
+  try {
+    $iterations = [int]$parts[1]
+    $salt = [Convert]::FromBase64String($parts[2])
+    $expected = [Convert]::FromBase64String($parts[3])
+    $derive = [System.Security.Cryptography.Rfc2898DeriveBytes]::new($Password, $salt, $iterations, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+      $actual = $derive.GetBytes($expected.Length)
+    } finally {
+      $derive.Dispose()
+    }
+    if ($actual.Length -ne $expected.Length) {
+      return $false
+    }
+
+    $diff = 0
+    for ($i = 0; $i -lt $actual.Length; $i++) {
+      $diff = $diff -bor ($actual[$i] -bxor $expected[$i])
+    }
+    return $diff -eq 0
+  } catch {
+    return $false
+  }
+}
+
+function Get-TokenHash([string]$Token) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Token)
+    return [Convert]::ToBase64String($sha.ComputeHash($bytes))
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+function New-SessionToken {
+  return ConvertTo-Base64Url (Get-RandomBytes 32)
+}
+
+function Get-CookieValue($Request, [string]$Name) {
+  if ($null -eq $Request.Headers -or -not $Request.Headers.ContainsKey("cookie")) {
+    return $null
+  }
+
+  foreach ($part in @($Request.Headers["cookie"] -split ";")) {
+    $pair = @($part.Trim() -split "=", 2)
+    if ($pair.Count -eq 2 -and $pair[0] -eq $Name) {
+      return $pair[1]
+    }
+  }
+
+  return $null
+}
+
+function Get-PublicUser($User) {
+  if ($null -eq $User) {
+    return $null
+  }
+
+  return [pscustomobject][ordered]@{
+    id = $User.id
+    name = $User.name
+    email = $User.email
+    role = $User.role
+    status = $User.status
+    created_at = $User.created_at
+    updated_at = $User.updated_at
+    last_login_at = $User.last_login_at
+  }
+}
+
+function Get-RoleLabel([string]$Role) {
+  switch ("$Role".ToLowerInvariant()) {
+    "admin" { "Administrador" }
+    "operator" { "Operador" }
+    "viewer" { "Visualizador" }
+    default { $Role }
+  }
+}
+
+function Test-RoleAllowed([string]$Role, [string[]]$AllowedRoles) {
+  return $AllowedRoles -contains "$Role".ToLowerInvariant()
+}
+
+function Get-CurrentUser($Store, $Request) {
+  $token = Get-CookieValue $Request "monitor_session"
+  if ([string]::IsNullOrWhiteSpace($token)) {
+    return $null
+  }
+
+  $tokenHash = Get-TokenHash $token
+  $now = Get-Date
+  $session = @(Get-CleanArray $Store.sessions) |
+    Where-Object { $_.token_hash -eq $tokenHash -and $_.status -eq "active" } |
+    Select-Object -First 1
+
+  if ($null -eq $session) {
+    return $null
+  }
+
+  if ([datetime]::Parse($session.expires_at) -lt $now) {
+    $session.status = "expired"
+    return $null
+  }
+
+  $user = @(Get-CleanArray $Store.users) |
+    Where-Object { $_.id -eq $session.user_id -and $_.status -eq "active" } |
+    Select-Object -First 1
+
+  return $user
+}
+
+function Get-UserByEmail($Store, [string]$Email) {
+  $normalized = "$Email".Trim().ToLowerInvariant()
+  return @(Get-CleanArray $Store.users) |
+    Where-Object { "$($_.email)".ToLowerInvariant() -eq $normalized } |
+    Select-Object -First 1
+}
+
+function Get-UserById($Store, [string]$UserId) {
+  return @(Get-CleanArray $Store.users) |
+    Where-Object { $_.id -eq $UserId } |
+    Select-Object -First 1
+}
+
+function Add-AuditLog($Store, $User, [string]$Action, [string]$EntityType, [string]$EntityId, $Metadata = $null) {
+  $entry = [pscustomobject][ordered]@{
+    id = New-EntityId "aud"
+    user_id = if ($null -eq $User) { $null } else { $User.id }
+    action = $Action
+    entity_type = $EntityType
+    entity_id = $EntityId
+    created_at = Get-NowIso
+    metadata = $Metadata
+  }
+  $Store.audit_logs = @(Get-CleanArray $Store.audit_logs) + $entry
+}
+
+function Get-UserBodyError($Body, [bool]$IsCreate) {
+  if ($null -eq $Body) {
+    return "Corpo da requisicao invalido."
+  }
+
+  if ($IsCreate -or $null -ne $Body.name) {
+    if ([string]::IsNullOrWhiteSpace($Body.name) -or "$($Body.name)".Trim().Length -gt 80) {
+      return "Nome e obrigatorio e deve ter ate 80 caracteres."
+    }
+  }
+
+  if ($IsCreate -or $null -ne $Body.email) {
+    if ([string]::IsNullOrWhiteSpace($Body.email) -or "$($Body.email)" -notmatch "^[^@\s]+@[^@\s]+\.[^@\s]+$") {
+      return "Email invalido."
+    }
+  }
+
+  if ($IsCreate -or $null -ne $Body.role) {
+    if (-not (Test-AllowedValue "$($Body.role)" @("admin", "operator", "viewer"))) {
+      return "Cargo invalido."
+    }
+  }
+
+  if ($IsCreate -or $null -ne $Body.password) {
+    if ([string]::IsNullOrWhiteSpace($Body.password) -or "$($Body.password)".Length -lt 8) {
+      return "Senha deve ter pelo menos 8 caracteres."
+    }
+  }
+
+  if ($null -ne $Body.status -and -not (Test-AllowedValue "$($Body.status)" @("active", "inactive"))) {
+    return "Status de usuario invalido."
+  }
+
+  return $null
+}
+
+function New-UserFromBody($Body, [string]$Now) {
+  return [pscustomobject][ordered]@{
+    id = New-EntityId "usr"
+    name = "$($Body.name)".Trim()
+    email = "$($Body.email)".Trim().ToLowerInvariant()
+    password_hash = Get-PasswordHash "$($Body.password)"
+    role = "$($Body.role)".Trim().ToLowerInvariant()
+    status = "active"
+    created_at = $Now
+    updated_at = $Now
+    last_login_at = $null
+  }
+}
+
+function New-Session($Store, $User, $Request) {
+  $token = New-SessionToken
+  $now = Get-Date
+  $session = [pscustomobject][ordered]@{
+    id = New-EntityId "ses"
+    user_id = $User.id
+    token_hash = Get-TokenHash $token
+    status = "active"
+    created_at = $now.ToString("o")
+    expires_at = $now.AddHours(8).ToString("o")
+    ip_address = if ($null -eq $Request.RemoteEndPoint) { $null } else { "$($Request.RemoteEndPoint)" }
+    user_agent = if ($Request.Headers.ContainsKey("user-agent")) { $Request.Headers["user-agent"] } else { $null }
+  }
+  $Store.sessions = @(Get-CleanArray $Store.sessions | Where-Object { $_.status -eq "active" -and [datetime]::Parse($_.expires_at) -gt $now }) + $session
+  return [pscustomobject]@{ token = $token; session = $session }
+}
+
+function Get-SessionCookieHeader([string]$Token) {
+  return "Set-Cookie: monitor_session=$Token; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800"
+}
+
+function Get-ClearSessionCookieHeader {
+  return "Set-Cookie: monitor_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
 }
 
 function Get-DeviceBodyError($Body, [bool]$IsCreate) {
@@ -404,6 +668,208 @@ function Handle-ApiRequest($Context) {
       return
     }
 
+    if ($method -eq "GET" -and $path -eq "/api/auth/status") {
+      $currentUser = Get-CurrentUser $store $request
+      Save-Store $store
+      Send-Json $Context ([pscustomobject]@{
+        setup_required = @(Get-CleanArray $store.users).Count -eq 0
+        authenticated = $null -ne $currentUser
+        user = Get-PublicUser $currentUser
+        roles = @(
+          [pscustomobject]@{ value = "admin"; label = "Administrador" },
+          [pscustomobject]@{ value = "operator"; label = "Operador" },
+          [pscustomobject]@{ value = "viewer"; label = "Visualizador" }
+        )
+      })
+      return
+    }
+
+    if ($method -eq "POST" -and $path -eq "/api/auth/setup") {
+      if (@(Get-CleanArray $store.users).Count -gt 0) {
+        Send-Json $Context ([pscustomobject]@{ error = "Administrador inicial ja foi criado." }) 403
+        return
+      }
+
+      $body = Read-RequestJson $request
+      if ($null -eq $body) {
+        Send-Json $Context ([pscustomobject]@{ error = "Corpo da requisicao invalido." }) 400
+        return
+      }
+      $body | Add-Member -NotePropertyName role -NotePropertyValue "admin" -Force
+      $bodyError = Get-UserBodyError $body $true
+      if ($null -ne $bodyError) {
+        Send-Json $Context ([pscustomobject]@{ error = $bodyError }) 400
+        return
+      }
+
+      $now = Get-NowIso
+      $user = New-UserFromBody $body $now
+      $store.users = @(Get-CleanArray $store.users) + $user
+      $sessionResult = New-Session $store $user $request
+      $user.last_login_at = $now
+      Add-AuditLog $store $user "auth.setup" "user" $user.id ([pscustomobject]@{ role = $user.role })
+      Save-Store $store
+      Send-Json $Context ([pscustomobject]@{ ok = $true; user = Get-PublicUser $user }) 201 @((Get-SessionCookieHeader $sessionResult.token))
+      return
+    }
+
+    if ($method -eq "POST" -and $path -eq "/api/auth/login") {
+      $body = Read-RequestJson $request
+      if ($null -eq $body -or [string]::IsNullOrWhiteSpace($body.email) -or [string]::IsNullOrWhiteSpace($body.password)) {
+        Send-Json $Context ([pscustomobject]@{ error = "Informe email e senha." }) 400
+        return
+      }
+
+      $user = Get-UserByEmail $store "$($body.email)"
+      if ($null -eq $user -or $user.status -ne "active" -or -not (Test-PasswordHash "$($body.password)" "$($user.password_hash)")) {
+        Send-Json $Context ([pscustomobject]@{ error = "Email ou senha invalidos." }) 401
+        return
+      }
+
+      $sessionResult = New-Session $store $user $request
+      $user.last_login_at = Get-NowIso
+      $user.updated_at = Get-NowIso
+      Add-AuditLog $store $user "auth.login" "user" $user.id $null
+      Save-Store $store
+      Send-Json $Context ([pscustomobject]@{ ok = $true; user = Get-PublicUser $user }) 200 @((Get-SessionCookieHeader $sessionResult.token))
+      return
+    }
+
+    if ($method -eq "POST" -and $path -eq "/api/auth/logout") {
+      $token = Get-CookieValue $request "monitor_session"
+      if (-not [string]::IsNullOrWhiteSpace($token)) {
+        $tokenHash = Get-TokenHash $token
+        foreach ($session in @(Get-CleanArray $store.sessions)) {
+          if ($session.token_hash -eq $tokenHash) {
+            $session.status = "revoked"
+          }
+        }
+        Save-Store $store
+      }
+      Send-Json $Context ([pscustomobject]@{ ok = $true }) 200 @((Get-ClearSessionCookieHeader))
+      return
+    }
+
+    $currentUser = Get-CurrentUser $store $request
+    if ($null -eq $currentUser) {
+      Save-Store $store
+      Send-Json $Context ([pscustomobject]@{ error = "Login necessario." }) 401 @((Get-ClearSessionCookieHeader))
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/auth/me") {
+      Send-Json $Context ([pscustomobject]@{ user = Get-PublicUser $currentUser })
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/users") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem listar usuarios." }) 403
+        return
+      }
+
+      $users = @(Get-CleanArray $store.users) | ForEach-Object { Get-PublicUser $_ }
+      Send-JsonArray $Context $users
+      return
+    }
+
+    if ($method -eq "POST" -and $path -eq "/api/users") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem criar usuarios." }) 403
+        return
+      }
+
+      $body = Read-RequestJson $request
+      $bodyError = Get-UserBodyError $body $true
+      if ($null -ne $bodyError) {
+        Send-Json $Context ([pscustomobject]@{ error = $bodyError }) 400
+        return
+      }
+
+      if ($null -ne (Get-UserByEmail $store "$($body.email)")) {
+        Send-Json $Context ([pscustomobject]@{ error = "Ja existe usuario com este email." }) 400
+        return
+      }
+
+      $now = Get-NowIso
+      $newUser = New-UserFromBody $body $now
+      $store.users = @(Get-CleanArray $store.users) + $newUser
+      Add-AuditLog $store $currentUser "users.create" "user" $newUser.id ([pscustomobject]@{ role = $newUser.role })
+      Save-Store $store
+      Send-Json $Context (Get-PublicUser $newUser) 201
+      return
+    }
+
+    if ($segments.Count -ge 3 -and $segments[0] -eq "api" -and $segments[1] -eq "users") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem gerenciar usuarios." }) 403
+        return
+      }
+
+      $userId = $segments[2]
+      $targetUser = Get-UserById $store $userId
+      if ($null -eq $targetUser) {
+        Send-Json $Context ([pscustomobject]@{ error = "Usuario nao encontrado." }) 404
+        return
+      }
+
+      if ($method -eq "PUT" -and $segments.Count -eq 3) {
+        $body = Read-RequestJson $request
+        $bodyError = Get-UserBodyError $body $false
+        if ($null -ne $bodyError) {
+          Send-Json $Context ([pscustomobject]@{ error = $bodyError }) 400
+          return
+        }
+
+        if ($null -ne $body.email) {
+          $sameEmail = Get-UserByEmail $store "$($body.email)"
+          if ($null -ne $sameEmail -and $sameEmail.id -ne $targetUser.id) {
+            Send-Json $Context ([pscustomobject]@{ error = "Ja existe usuario com este email." }) 400
+            return
+          }
+          $targetUser.email = "$($body.email)".Trim().ToLowerInvariant()
+        }
+        if ($null -ne $body.name) { $targetUser.name = "$($body.name)".Trim() }
+        if ($null -ne $body.role) { $targetUser.role = "$($body.role)".Trim().ToLowerInvariant() }
+        if ($null -ne $body.status) { $targetUser.status = "$($body.status)".Trim().ToLowerInvariant() }
+        if ($null -ne $body.password -and -not [string]::IsNullOrWhiteSpace($body.password)) {
+          $targetUser.password_hash = Get-PasswordHash "$($body.password)"
+        }
+
+        $activeAdmins = @(Get-CleanArray $store.users | Where-Object { $_.role -eq "admin" -and $_.status -eq "active" })
+        if ($activeAdmins.Count -eq 0) {
+          Send-Json $Context ([pscustomobject]@{ error = "Deve existir pelo menos um administrador ativo." }) 400
+          return
+        }
+
+        $targetUser.updated_at = Get-NowIso
+        Add-AuditLog $store $currentUser "users.update" "user" $targetUser.id ([pscustomobject]@{ role = $targetUser.role; status = $targetUser.status })
+        Save-Store $store
+        Send-Json $Context (Get-PublicUser $targetUser)
+        return
+      }
+
+      if ($method -eq "DELETE" -and $segments.Count -eq 3) {
+        if ($targetUser.id -eq $currentUser.id) {
+          Send-Json $Context ([pscustomobject]@{ error = "Voce nao pode excluir seu proprio usuario." }) 400
+          return
+        }
+
+        $remainingAdmins = @(Get-CleanArray $store.users | Where-Object { $_.id -ne $targetUser.id -and $_.role -eq "admin" -and $_.status -eq "active" })
+        if ($targetUser.role -eq "admin" -and $remainingAdmins.Count -eq 0) {
+          Send-Json $Context ([pscustomobject]@{ error = "Deve existir pelo menos um administrador ativo." }) 400
+          return
+        }
+
+        $store.users = @(Get-CleanArray $store.users | Where-Object { $_.id -ne $targetUser.id })
+        $store.sessions = @(Get-CleanArray $store.sessions | Where-Object { $_.user_id -ne $targetUser.id })
+        Add-AuditLog $store $currentUser "users.delete" "user" $targetUser.id $null
+        Save-Store $store
+        Send-Json $Context ([pscustomobject]@{ ok = $true })
+        return
+      }
+    }
+
     if ($method -eq "GET" -and $path -eq "/api/summary") {
       Send-Json $Context (Get-Summary $store)
       return
@@ -415,6 +881,11 @@ function Handle-ApiRequest($Context) {
     }
 
     if ($method -eq "POST" -and $path -eq "/api/devices") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite cadastrar dispositivos." }) 403
+        return
+      }
+
       $body = Read-RequestJson $request
       $bodyError = Get-DeviceBodyError $body $true
       if ($null -ne $bodyError) {
@@ -425,6 +896,7 @@ function Handle-ApiRequest($Context) {
       $now = Get-NowIso
       $device = New-DeviceFromBody $body $now
       $store.devices = @(Get-CleanArray $store.devices) + $device
+      Add-AuditLog $store $currentUser "devices.create" "device" $device.id ([pscustomobject]@{ host = $device.host; criticality = $device.criticality })
       Save-Store $store
       Send-Json $Context $device 201
       return
@@ -439,6 +911,11 @@ function Handle-ApiRequest($Context) {
       }
 
       if ($method -eq "PUT" -and $segments.Count -eq 3) {
+        if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator"))) {
+          Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite editar dispositivos." }) 403
+          return
+        }
+
         $body = Read-RequestJson $request
         $bodyError = Get-DeviceBodyError $body $false
         if ($null -ne $bodyError) {
@@ -446,23 +923,36 @@ function Handle-ApiRequest($Context) {
           return
         }
         Update-DeviceFromBody $device $body (Get-NowIso)
+        Add-AuditLog $store $currentUser "devices.update" "device" $device.id $null
         Save-Store $store
         Send-Json $Context $device
         return
       }
 
       if ($method -eq "DELETE" -and $segments.Count -eq 3) {
+        if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator"))) {
+          Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite excluir dispositivos." }) 403
+          return
+        }
+
         $eventIds = @(Get-CleanArray $store.status_events | Where-Object { $_.device_id -eq $deviceId } | ForEach-Object { $_.id })
         $store.devices = @(Get-CleanArray $store.devices | Where-Object { $_.id -ne $deviceId })
         $store.status_events = @(Get-CleanArray $store.status_events | Where-Object { $_.device_id -ne $deviceId })
         $store.alerts = @(Get-CleanArray $store.alerts | Where-Object { $_.device_id -ne $deviceId -and $eventIds -notcontains $_.status_event_id })
+        Add-AuditLog $store $currentUser "devices.delete" "device" $deviceId $null
         Save-Store $store
         Send-Json $Context ([pscustomobject]@{ ok = $true })
         return
       }
 
       if ($method -eq "POST" -and $segments.Count -eq 4 -and $segments[3] -eq "check") {
+        if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator"))) {
+          Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite executar verificacoes." }) 403
+          return
+        }
+
         $result = Invoke-DeviceCheck $store $device
+        Add-AuditLog $store $currentUser "devices.check" "device" $device.id ([pscustomobject]@{ status = $result.status })
         Save-Store $store
         Send-Json $Context $result
         return
@@ -470,7 +960,15 @@ function Handle-ApiRequest($Context) {
     }
 
     if ($method -eq "POST" -and $path -eq "/api/monitor/run") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite executar monitoramento." }) 403
+        return
+      }
+
       $results = Invoke-MonitorCycle
+      $store = Read-Store
+      Add-AuditLog $store $currentUser "monitor.run" "monitor" "cycle" ([pscustomobject]@{ count = @($results).Count })
+      Save-Store $store
       Send-Json $Context ([pscustomobject]@{ ok = $true; results = $results })
       return
     }
@@ -486,6 +984,11 @@ function Handle-ApiRequest($Context) {
     }
 
     if ($segments.Count -eq 4 -and $method -eq "POST" -and $segments[0] -eq "api" -and $segments[1] -eq "alerts" -and $segments[3] -eq "resolve") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite resolver alertas." }) 403
+        return
+      }
+
       $alertId = $segments[2]
       $alert = @(Get-CleanArray $store.alerts) | Where-Object { $_.id -eq $alertId } | Select-Object -First 1
       if ($null -eq $alert) {
@@ -495,6 +998,7 @@ function Handle-ApiRequest($Context) {
 
       $alert.status = "resolved"
       $alert.resolved_at = Get-NowIso
+      Add-AuditLog $store $currentUser "alerts.resolve" "alert" $alert.id $null
       Save-Store $store
       Send-Json $Context $alert
       return
@@ -599,6 +1103,8 @@ function Read-TcpHttpContext($Client) {
     Url = $uri
     HasEntityBody = $contentLength -gt 0
     ContentBody = $body
+    Headers = $headers
+    RemoteEndPoint = $Client.Client.RemoteEndPoint
   }
 
   return [pscustomobject]@{

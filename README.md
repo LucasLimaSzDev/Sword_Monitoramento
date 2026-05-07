@@ -1,4 +1,4 @@
-# Sword 1.0
+# Sword 2.0
 
 <p align="center">
   <img src="./public/sword-logo.svg" alt="Sword logo" width="96">
@@ -16,7 +16,7 @@
 
 ## Visao geral
 
-Primeira versao publica do painel local de monitoramento de dispositivos.
+Evolucao do MVP com autenticacao, usuarios e papeis operacionais.
 
 Sword foi criado e desenvolvido por Lucas Lima (LucasLimaSzDev) como uma
 solucao local para acompanhar disponibilidade, ativos, alertas e incidentes de
@@ -24,11 +24,11 @@ infraestrutura.
 
 ## Destaques da versao
 
-- MVP web local para cadastro e monitoramento de dispositivos.
-- Backend PowerShell com API HTTP e frontend estatico.
-- Monitoramento por ICMP ping.
-- Eventos de queda e retorno com duracao de indisponibilidade.
-- Dashboard com indicadores, filtros, tabela, alertas e historico.
+- Setup do primeiro administrador.
+- Login e logout com sessao em cookie HttpOnly.
+- Cargos de Administrador, Operador e Visualizador.
+- Gestao de usuarios para administradores.
+- Senhas com PBKDF2-SHA256 e salt individual.
 
 ## Como executar
 

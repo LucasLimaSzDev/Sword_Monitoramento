@@ -7,5 +7,14 @@
                       ],
     "alerts":  [
 
-               ]
+               ],
+    "users":  [
+
+              ],
+    "sessions":  [
+
+                 ],
+    "audit_logs":  [
+
+                   ]
 }

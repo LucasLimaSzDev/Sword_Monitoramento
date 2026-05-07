@@ -2,6 +2,16 @@
 
 Todas as versoes publicas do Sword listadas aqui foram criadas por Lucas Lima (LucasLimaSzDev).
 
+## v2.0 - 2.0
+
+Evolucao do MVP com autenticacao, usuarios e papeis operacionais.
+
+- Setup do primeiro administrador.
+- Login e logout com sessao em cookie HttpOnly.
+- Cargos de Administrador, Operador e Visualizador.
+- Gestao de usuarios para administradores.
+- Senhas com PBKDF2-SHA256 e salt individual.
+
 ## v1.0 - 1.0
 
 Primeira versao publica do painel local de monitoramento de dispositivos.

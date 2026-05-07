@@ -4,10 +4,17 @@
     loading: true,
     error: "",
     toast: "",
+    auth: {
+      checked: false,
+      setupRequired: false,
+      user: null,
+      roles: []
+    },
     summary: null,
     devices: [],
     events: [],
     alerts: [],
+    users: [],
     filters: {
       search: "",
       status: "all",
@@ -19,7 +26,8 @@
       status: "all",
       criticality: "all"
     },
-    modal: null
+    modal: null,
+    userModal: null
   };
 
   const app = document.getElementById("app");
@@ -33,7 +41,8 @@
   function request(url, options = {}) {
     const init = {
       method: options.method || "GET",
-      headers: { "Content-Type": "application/json" }
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin"
     };
 
     if (options.body) {
@@ -51,10 +60,34 @@
         }
       }
       if (!response.ok) {
+        if (response.status === 401) {
+          state.auth.user = null;
+          state.auth.setupRequired = false;
+          state.loading = false;
+          state.error = "";
+          render();
+        }
         throw new Error((data && data.error) || "Falha na requisicao.");
       }
       return data;
     });
+  }
+
+  function canOperate() {
+    return state.auth.user && ["admin", "operator"].includes(state.auth.user.role);
+  }
+
+  function isAdmin() {
+    return state.auth.user && state.auth.user.role === "admin";
+  }
+
+  function roleLabel(role) {
+    const map = {
+      admin: "Administrador",
+      operator: "Operador",
+      viewer: "Visualizador"
+    };
+    return map[role] || role || "-";
   }
 
   function asArray(value) {
@@ -195,6 +228,12 @@
   }
 
   async function loadData({ silent = false } = {}) {
+    if (!state.auth.user) {
+      state.loading = false;
+      render();
+      return;
+    }
+
     if (!silent) {
       state.loading = true;
       state.error = "";
@@ -231,18 +270,66 @@
     }, 2600);
   }
 
+  async function loadAuthStatus() {
+    try {
+      const status = await api.get("/api/auth/status");
+      state.auth.checked = true;
+      state.auth.setupRequired = Boolean(status?.setup_required);
+      state.auth.user = status?.authenticated ? status.user : null;
+      state.auth.roles = asArray(status?.roles);
+      if (state.auth.user) {
+        await loadData({ silent: true });
+      } else {
+        state.loading = false;
+        render();
+      }
+    } catch (error) {
+      state.auth.checked = true;
+      state.loading = false;
+      state.error = error.message;
+      render();
+    }
+  }
+
+  async function loadUsers() {
+    if (!isAdmin()) {
+      state.users = [];
+      return;
+    }
+
+    state.users = asArray(await api.get("/api/users"));
+  }
+
   function pageTitle() {
     const map = {
       dashboard: ["Dashboard", "Visao geral da infraestrutura"],
       devices: ["Dispositivos", "Cadastro e operacao dos ativos monitorados"],
       alerts: ["Alertas", "Ocorrencias criticas em aberto"],
-      history: ["Historico", "Eventos de disponibilidade e indisponibilidade"]
+      history: ["Historico", "Eventos de disponibilidade e indisponibilidade"],
+      users: ["Usuarios", "Controle de acesso e cargos"]
     };
     return map[state.view] || map.dashboard;
   }
 
   function render() {
     try {
+      if (!state.auth.checked) {
+        app.innerHTML = `<div class="fatal-screen"><section class="panel">Carregando seguranca...</section></div>`;
+        return;
+      }
+
+      if (state.auth.setupRequired) {
+        app.innerHTML = renderSetupScreen();
+        bindAuthEvents();
+        return;
+      }
+
+      if (!state.auth.user) {
+        app.innerHTML = renderLoginScreen();
+        bindAuthEvents();
+        return;
+      }
+
       const [title, subtitle] = pageTitle();
       app.innerHTML = `
         <div class="app-shell">
@@ -256,14 +343,15 @@
               <div class="top-actions">
                 <div class="live-pill"><span class="live-dot"></span>Monitoramento ativo</div>
                 <div class="timestamp">Atualizado: ${state.summary ? timeAgo(state.summary.generated_at) : "-"}</div>
-                <button class="button" data-action="run-monitor">Verificar agora</button>
+                ${canOperate() ? `<button class="button" data-action="run-monitor">Verificar agora</button>` : ""}
                 <div class="user-chip">
-                  <div class="avatar">OP</div>
+                  <div class="avatar">${escapeHtml(getInitials(state.auth.user.name))}</div>
                   <div>
-                    <strong>Operador local</strong>
-                    <div class="mini-text">Acesso localhost</div>
+                    <strong>${escapeHtml(state.auth.user.name)}</strong>
+                    <div class="mini-text">${roleLabel(state.auth.user.role)}</div>
                   </div>
                 </div>
+                <button class="button" data-action="logout">Sair</button>
               </div>
             </header>
             <section class="content">
@@ -273,6 +361,7 @@
             </section>
           </main>
           ${state.modal ? renderModal() : ""}
+          ${state.userModal ? renderUserModal() : ""}
           ${state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : ""}
         </div>
       `;
@@ -294,6 +383,73 @@
     }
   }
 
+  function getInitials(name) {
+    return String(name || "U")
+      .trim()
+      .split(/\s+/)
+      .slice(0, 2)
+      .map((part) => part[0] || "")
+      .join("")
+      .toUpperCase() || "U";
+  }
+
+  function renderAuthShell(title, subtitle, formHtml) {
+    return `
+      <div class="auth-screen">
+        <section class="auth-panel">
+          <div class="auth-brand">
+            <div class="brand-mark">MI</div>
+            <div>
+              <div class="brand-title">Monitoramento</div>
+              <div class="brand-subtitle">Acesso seguro ao painel</div>
+            </div>
+          </div>
+          <h1>${title}</h1>
+          <p>${subtitle}</p>
+          ${state.error ? `<div class="auth-error">${escapeHtml(state.error)}</div>` : ""}
+          ${formHtml}
+        </section>
+      </div>
+    `;
+  }
+
+  function renderSetupScreen() {
+    return renderAuthShell(
+      "Criar administrador",
+      "Configure o primeiro usuario com permissao total para iniciar a versao 2.0.",
+      `
+        <form class="auth-form" id="setup-form">
+          <label>Nome<input class="input" name="name" required autocomplete="name"></label>
+          <label>Email<input class="input" name="email" required type="email" autocomplete="email"></label>
+          <label>Senha<input class="input" name="password" required type="password" minlength="8" autocomplete="new-password"></label>
+          <button class="button primary" type="submit">Criar administrador</button>
+        </form>
+      `
+    );
+  }
+
+  function renderLoginScreen() {
+    return renderAuthShell(
+      "Entrar no sistema",
+      "Use seu usuario para acessar o dashboard, alertas e historico.",
+      `
+        <form class="auth-form" id="login-form">
+          <label>Email<input class="input" name="email" required type="email" autocomplete="email"></label>
+          <label>Senha<input class="input" name="password" required type="password" autocomplete="current-password"></label>
+          <button class="button primary" type="submit">Entrar</button>
+        </form>
+      `
+    );
+  }
+
+  function bindAuthEvents() {
+    const setupForm = document.getElementById("setup-form");
+    if (setupForm) setupForm.addEventListener("submit", handleSetupSubmit);
+
+    const loginForm = document.getElementById("login-form");
+    if (loginForm) loginForm.addEventListener("submit", handleLoginSubmit);
+  }
+
   function renderSidebar() {
     const count = openAlerts().length;
     const items = [
@@ -302,6 +458,9 @@
       ["alerts", "AL", "Alertas"],
       ["history", "EV", "Historico"]
     ];
+    if (isAdmin()) {
+      items.push(["users", "US", "Usuarios"]);
+    }
 
     return `
       <aside class="sidebar">
@@ -324,8 +483,8 @@
         <div class="sidebar-spacer"></div>
         <div class="sidebar-info">
           <div class="mini-panel">
-            <div class="mini-title">Ambiente local</div>
-            <div class="mini-text">Servidor em localhost</div>
+            <div class="mini-title">Sessao segura</div>
+            <div class="mini-text">${escapeHtml(state.auth.user.email)}</div>
           </div>
           <div class="mini-panel">
             <div class="mini-title">Base de dados</div>
@@ -340,6 +499,7 @@
     if (state.view === "devices") return renderDevicesPage();
     if (state.view === "alerts") return renderAlertsPage();
     if (state.view === "history") return renderHistoryPage();
+    if (state.view === "users") return renderUsersPage();
     return renderDashboard();
   }
 
@@ -419,7 +579,7 @@
           <p>Cadastre os ativos reais da rede para iniciar as verificacoes de disponibilidade.</p>
         </div>
         <div class="empty-actions">
-          <button class="button primary" data-action="new-device">Cadastrar dispositivo</button>
+          ${canOperate() ? `<button class="button primary" data-action="new-device">Cadastrar dispositivo</button>` : ""}
           <button class="button" data-view="devices">Abrir cadastro</button>
         </div>
       </section>
@@ -451,7 +611,7 @@
           <option value="alta"${state.filters.criticality === "alta" ? " selected" : ""}>Alta</option>
           <option value="critica"${state.filters.criticality === "critica" ? " selected" : ""}>Critica</option>
         </select>
-        <button class="button primary" data-action="new-device">Novo dispositivo</button>
+        ${canOperate() ? `<button class="button primary" data-action="new-device">Novo dispositivo</button>` : ""}
       </div>
     `;
   }
@@ -483,7 +643,7 @@
               </tr>
             </thead>
             <tbody>
-              ${visible.map(renderDeviceRow).join("") || `<tr><td colspan="8"><div class="empty-state">${emptyText}<br><button class="button primary" data-action="new-device">Cadastrar dispositivo</button></div></td></tr>`}
+              ${visible.map(renderDeviceRow).join("") || `<tr><td colspan="8"><div class="empty-state">${emptyText}${canOperate() ? `<br><button class="button primary" data-action="new-device">Cadastrar dispositivo</button>` : ""}</div></td></tr>`}
             </tbody>
           </table>
         </div>
@@ -510,11 +670,13 @@
         <td>${lastCheck}</td>
         <td><span class="badge ${status}">${status === "inactive" ? "INATIVO" : device.current_status.toUpperCase()}</span></td>
         <td>
-          <div class="row-actions">
-            <button class="button compact" title="Verificar agora" data-action="check-device" data-id="${device.id}">Verificar</button>
-            <button class="button compact" title="Editar" data-action="edit-device" data-id="${device.id}">Editar</button>
-            <button class="button compact danger" title="Remover" data-action="delete-device" data-id="${device.id}">Excluir</button>
-          </div>
+          ${canOperate() ? `
+            <div class="row-actions">
+              <button class="button compact" title="Verificar agora" data-action="check-device" data-id="${device.id}">Verificar</button>
+              <button class="button compact" title="Editar" data-action="edit-device" data-id="${device.id}">Editar</button>
+              <button class="button compact danger" title="Remover" data-action="delete-device" data-id="${device.id}">Excluir</button>
+            </div>
+          ` : ""}
         </td>
       </tr>
     `;
@@ -545,7 +707,7 @@
           <div class="alert-title">${escapeHtml(alert.title)}</div>
           <div class="alert-meta">${escapeHtml(device.location || "-")} - ${escapeHtml(device.host || "-")} - ${timeAgo(alert.created_at)}</div>
         </div>
-        <button class="button" data-action="resolve-alert" data-id="${alert.id}">Resolver</button>
+        ${canOperate() ? `<button class="button" data-action="resolve-alert" data-id="${alert.id}">Resolver</button>` : ""}
       </article>
     `;
   }
@@ -632,7 +794,7 @@
       <section class="panel">
         <div class="section-header">
           <h2 class="section-title">Alertas criticos em aberto</h2>
-          <button class="button" data-action="run-monitor">Atualizar monitoramento</button>
+          ${canOperate() ? `<button class="button" data-action="run-monitor">Atualizar monitoramento</button>` : ""}
         </div>
         <div class="alert-list">
           ${alerts.map(renderAlertItem).join("") || `<div class="empty-state">Nenhum alerta aberto neste momento.</div>`}
@@ -701,6 +863,57 @@
     `;
   }
 
+  function renderUsersPage() {
+    if (!isAdmin()) {
+      return `<section class="panel">Apenas administradores podem acessar usuarios.</section>`;
+    }
+
+    return `
+      <section class="table-panel">
+        <div class="section-header" style="padding: 18px 18px 0;">
+          <h2 class="section-title">Usuarios e cargos</h2>
+          <button class="button primary" data-action="new-user">Novo usuario</button>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Nome</th>
+                <th>Email</th>
+                <th>Cargo</th>
+                <th>Status</th>
+                <th>Ultimo login</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${asArray(state.users).map(renderUserRow).join("") || `<tr><td colspan="6"><div class="empty-state">Nenhum usuario encontrado.</div></td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderUserRow(user) {
+    const isSelf = state.auth.user && state.auth.user.id === user.id;
+    return `
+      <tr>
+        <td><strong>${escapeHtml(user.name)}</strong>${isSelf ? ` <span class="badge inactive">VOCE</span>` : ""}</td>
+        <td>${escapeHtml(user.email)}</td>
+        <td><span class="badge ${user.role === "admin" ? "critical" : user.role === "operator" ? "high" : "low"}">${roleLabel(user.role)}</span></td>
+        <td><span class="badge ${user.status === "active" ? "online" : "inactive"}">${user.status === "active" ? "ATIVO" : "INATIVO"}</span></td>
+        <td>${user.last_login_at ? timeAgo(user.last_login_at) : "Nunca"}</td>
+        <td>
+          <div class="row-actions">
+            <button class="button compact" data-action="edit-user" data-id="${user.id}">Editar</button>
+            <button class="button compact danger" data-action="delete-user" data-id="${user.id}" ${isSelf ? "disabled" : ""}>Excluir</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }
+
   function renderModal() {
     const device = state.modal.device || {
       name: "",
@@ -765,10 +978,72 @@
     `;
   }
 
+  function renderUserModal() {
+    const user = state.userModal.user || {
+      name: "",
+      email: "",
+      role: "viewer",
+      status: "active"
+    };
+    const isEdit = Boolean(user.id);
+
+    return `
+      <div class="modal-backdrop">
+        <form class="modal" id="user-form">
+          <div class="modal-header">
+            <h2 class="section-title">${isEdit ? "Editar usuario" : "Novo usuario"}</h2>
+            <button class="button icon-only" type="button" data-action="close-user-modal">X</button>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label for="user-name">Nome</label>
+              <input class="input" id="user-name" name="name" required value="${escapeHtml(user.name)}">
+            </div>
+            <div class="field">
+              <label for="user-email">Email</label>
+              <input class="input" id="user-email" name="email" type="email" required value="${escapeHtml(user.email)}">
+            </div>
+            <div class="field">
+              <label for="user-role">Cargo</label>
+              <select class="select" id="user-role" name="role">
+                <option value="admin"${user.role === "admin" ? " selected" : ""}>Administrador</option>
+                <option value="operator"${user.role === "operator" ? " selected" : ""}>Operador</option>
+                <option value="viewer"${user.role === "viewer" ? " selected" : ""}>Visualizador</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="user-status">Status</label>
+              <select class="select" id="user-status" name="status">
+                <option value="active"${user.status === "active" ? " selected" : ""}>Ativo</option>
+                <option value="inactive"${user.status === "inactive" ? " selected" : ""}>Inativo</option>
+              </select>
+            </div>
+            <div class="field full">
+              <label for="user-password">${isEdit ? "Nova senha" : "Senha"}</label>
+              <input class="input" id="user-password" name="password" type="password" ${isEdit ? "" : "required"} minlength="8" autocomplete="new-password">
+              <div class="field-help">${isEdit ? "Deixe em branco para manter a senha atual." : "Minimo de 8 caracteres."}</div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="button" type="button" data-action="close-user-modal">Cancelar</button>
+            <button class="button primary" type="submit">${isEdit ? "Salvar usuario" : "Criar usuario"}</button>
+          </div>
+        </form>
+      </div>
+    `;
+  }
+
   function bindEvents() {
     app.querySelectorAll("[data-view]").forEach((button) => {
-      button.addEventListener("click", () => {
+      button.addEventListener("click", async () => {
         state.view = button.dataset.view;
+        if (state.view === "users") {
+          try {
+            await loadUsers();
+          } catch (error) {
+            setToast(error.message);
+          }
+        }
         render();
       });
     });
@@ -799,6 +1074,11 @@
     if (form) {
       form.addEventListener("submit", handleDeviceSubmit);
     }
+
+    const userForm = app.querySelector("#user-form");
+    if (userForm) {
+      userForm.addEventListener("submit", handleUserSubmit);
+    }
   }
 
   async function handleAction(event) {
@@ -809,6 +1089,47 @@
       if (action === "reload") {
         await loadData();
         return;
+      }
+
+      if (action === "logout") {
+        await api.post("/api/auth/logout");
+        state.auth.user = null;
+        state.auth.setupRequired = false;
+        state.view = "dashboard";
+        state.devices = [];
+        state.events = [];
+        state.alerts = [];
+        state.users = [];
+        render();
+        return;
+      }
+
+      if (action === "new-user") {
+        state.userModal = { user: null };
+        render();
+      }
+
+      if (action === "edit-user") {
+        const user = asArray(state.users).find((item) => item.id === id);
+        if (user) {
+          state.userModal = { user: { ...user } };
+          render();
+        }
+      }
+
+      if (action === "close-user-modal") {
+        state.userModal = null;
+        render();
+      }
+
+      if (action === "delete-user") {
+        const user = asArray(state.users).find((item) => item.id === id);
+        if (user && window.confirm(`Excluir o usuario ${user.name}?`)) {
+          await api.delete(`/api/users/${id}`);
+          await loadUsers();
+          setToast("Usuario removido.");
+          render();
+        }
       }
 
       if (action === "new-device") {
@@ -860,6 +1181,49 @@
     }
   }
 
+  async function handleSetupSubmit(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = {
+      name: form.get("name"),
+      email: form.get("email"),
+      password: form.get("password")
+    };
+
+    try {
+      state.error = "";
+      const response = await api.post("/api/auth/setup", payload);
+      state.auth.user = response.user;
+      state.auth.setupRequired = false;
+      await loadData({ silent: true });
+      setToast("Administrador criado.");
+    } catch (error) {
+      state.error = error.message;
+      render();
+    }
+  }
+
+  async function handleLoginSubmit(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = {
+      email: form.get("email"),
+      password: form.get("password")
+    };
+
+    try {
+      state.error = "";
+      const response = await api.post("/api/auth/login", payload);
+      state.auth.user = response.user;
+      state.auth.setupRequired = false;
+      await loadData({ silent: true });
+      setToast("Login realizado.");
+    } catch (error) {
+      state.error = error.message;
+      render();
+    }
+  }
+
   async function handleDeviceSubmit(event) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -892,9 +1256,40 @@
     }
   }
 
-  loadData();
+  async function handleUserSubmit(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const password = form.get("password");
+    const payload = {
+      name: form.get("name"),
+      email: form.get("email"),
+      role: form.get("role"),
+      status: form.get("status")
+    };
+    if (password) {
+      payload.password = password;
+    }
+
+    try {
+      if (state.userModal.user && state.userModal.user.id) {
+        await api.put(`/api/users/${state.userModal.user.id}`, payload);
+        setToast("Usuario atualizado.");
+      } else {
+        payload.password = password;
+        await api.post("/api/users", payload);
+        setToast("Usuario criado.");
+      }
+      state.userModal = null;
+      await loadUsers();
+      render();
+    } catch (error) {
+      setToast(error.message);
+    }
+  }
+
+  loadAuthStatus();
   window.setInterval(() => {
-    if (!state.modal) {
+    if (state.auth.user && !state.modal && !state.userModal) {
       loadData({ silent: true });
     }
   }, 5000);
